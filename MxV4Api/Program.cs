@@ -2,19 +2,18 @@ using MxV4Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. 注册单例服务
+// 注册 MxService (单例)
 builder.Services.AddSingleton<MxService>();
-builder.Services.AddHostedService<MxService>(provider => provider.GetRequiredService<MxService>());
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// 配置 Kestrel 限制 (可选，防止过多并发连接)
+// Kestrel 配置
 builder.WebHost.ConfigureKestrel(options =>
 {
-    options.Limits.MaxConcurrentConnections = 100;
-    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5); // 缩短保活时间
+    options.Limits.MaxConcurrentConnections = 200;
+    options.Limits.KeepAliveTimeout = TimeSpan.FromSeconds(5);
 });
 
 var app = builder.Build();
@@ -25,14 +24,23 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// ============================================================
-// 【关键修改 1】: 拦截 favicon.ico
-// 浏览器会自动请求这个图标，如果进入 PLC 队列会造成干扰。
-// 这里直接返回 204 No Content，不走后续逻辑。
-// ============================================================
 app.MapGet("/favicon.ico", () => Results.NoContent());
-
 app.UseAuthorization();
 app.MapControllers();
+
+// ============================================================
+// 【新增】执行预热逻辑
+// 必须在 app.Run() 之前调用
+// ============================================================
+try
+{
+    var mxManager = app.Services.GetRequiredService<MxService>();
+    // 这将读取 appsettings.json 并立即连接 PLC
+    mxManager.PreWarm();
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"预热失败: {ex.Message}");
+}
 
 app.Run();

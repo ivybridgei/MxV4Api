@@ -1,76 +1,144 @@
+using System.Text;
 using Microsoft.AspNetCore.Mvc;
 using MxV4Api.Services;
 
 namespace MxV4Api.Controllers
 {
     [ApiController]
-    [Route("api/[controller]")]
-    // 【关键修改 5】: 全局禁用浏览器缓存
+    [Route("api/plc")] // 基础路由
     [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
     public class PlcController : ControllerBase
     {
-        private readonly MxService _mxService;
+        private readonly MxService _mxManager;
 
-        public PlcController(MxService mxService)
+        public PlcController(MxService mxManager)
         {
-            _mxService = mxService;
+            _mxManager = mxManager;
         }
 
-        // 辅助方法：添加强制断开 Header
-        private void ForceShortConnection()
+        // 辅助：强制短连接
+        private void ForceShortConnection() => Response.Headers.Append("Connection", "close");
+
+        // 辅助：获取代理
+        private StationAgent GetAgent(int stationId) => _mxManager.GetAgent(stationId);
+
+        // ============================================================
+        // 1. 读取数值 (支持单个或批量)
+        // URL: GET /api/plc/{stationId}/read/{device}/{length?}
+        // length 默认为 1
+        // ============================================================
+        [HttpGet("{stationId}/read/{device}/{length?}")]
+        public async Task<IActionResult> Read(int stationId, string device, int length = 1)
         {
-            // 告诉浏览器：请求完立刻断开 TCP，不要 Keep-Alive
-            // 这能模拟 PHP/Curl 的行为，减轻服务器压力
-            Response.Headers.Append("Connection", "close");
+            ForceShortConnection();
+            if (length < 1) length = 1;
+
+            try
+            {
+                // 获取对应站点的代理（如果没有会自动创建线程）
+                var agent = GetAgent(stationId);
+
+                // 统一返回数组，方便前端处理
+                int[] data = await agent.ReadBlockAsync(device, length);
+
+                return Ok(new
+                {
+                    station = stationId,
+                    device,
+                    length,
+                    data = data, // 数组格式 [123, 456, ...]
+                    t = DateTime.Now.Ticks
+                });
+            }
+            catch (Exception ex)
+            {
+                return HandleError(ex);
+            }
         }
 
-        [HttpGet("read/{device}")]
-        public async Task<IActionResult> Read(string device)
+        // ============================================================
+        // 2. 读取字符串 (自动 ASCII 解码)
+        // URL: GET /api/plc/{stationId}/read-string/{device}/{length}
+        // ============================================================
+        [HttpGet("{stationId}/read-string/{device}/{length}")]
+        public async Task<IActionResult> ReadString(int stationId, string device, int length)
+        {
+            ForceShortConnection();
+            if (length < 1) length = 1;
+
+            try
+            {
+                var agent = GetAgent(stationId);
+                int[] rawData = await agent.ReadBlockAsync(device, length);
+
+                // 转换逻辑：int[] -> string
+                string result = IntsToAscii(rawData);
+
+                return Ok(new
+                {
+                    station = stationId,
+                    device,
+                    length,
+                    result,
+                    t = DateTime.Now.Ticks
+                });
+            }
+            catch (Exception ex)
+            {
+                return HandleError(ex);
+            }
+        }
+
+        // ============================================================
+        // 3. 写入数值
+        // URL: POST /api/plc/{stationId}/write
+        // Body: { "device": "D100", "value": 123 }
+        // ============================================================
+        [HttpPost("{stationId}/write")]
+        public async Task<IActionResult> Write(int stationId, [FromBody] WriteRequest req)
         {
             ForceShortConnection();
             try
             {
-                int value = await _mxService.ReadDeviceAsync(device);
-                return Ok(new { device, value, t = DateTime.Now.Ticks });
+                var agent = GetAgent(stationId);
+                await agent.WriteDeviceAsync(req.Device, req.Value);
+                return Ok(new { success = true, station = stationId });
             }
             catch (Exception ex)
             {
-                // 如果是队列满了，返回 503 Service Unavailable
-                if (ex.Message.Contains("Busy")) return StatusCode(503, new { error = "Server Busy" });
-                return StatusCode(500, new { error = ex.Message });
+                return HandleError(ex);
             }
         }
 
-        [HttpGet("read-string/{device}/{length}")]
-        public async Task<IActionResult> ReadString(string device, int length)
+        // 统一错误处理
+        private IActionResult HandleError(Exception ex)
         {
-            ForceShortConnection();
-            try
-            {
-                string result = await _mxService.ReadStringAsync(device, length);
-                return Ok(new { device, length, result });
-            }
-            catch (Exception ex)
-            {
-                if (ex.Message.Contains("Busy")) return StatusCode(503, new { error = "Server Busy" });
-                return StatusCode(500, new { error = ex.Message });
-            }
+            // 如果是队列满或超时
+            if (ex.Message.Contains("Busy") || ex.Message.Contains("Queue Full"))
+                return StatusCode(503, new { error = "Station Busy" });
+
+            return StatusCode(500, new { error = ex.Message });
         }
 
-        [HttpPost("write")]
-        public async Task<IActionResult> Write([FromBody] WriteRequest req)
+        // 辅助：Int/Short 转 ASCII 字符串
+        private string IntsToAscii(int[] data)
         {
-            ForceShortConnection();
-            try
+            if (data == null || data.Length == 0) return string.Empty;
+            StringBuilder sb = new StringBuilder(data.Length * 2);
+            foreach (int val in data)
             {
-                await _mxService.WriteDeviceAsync(req.Device, req.Value);
-                return Ok(new { success = true });
+                // MX Component ReadDeviceBlock2 读出来的是 short 强转的 int
+                // 低位在前，高位在后
+                byte lowByte = (byte)(val & 0xFF);
+                byte highByte = (byte)((val >> 8) & 0xFF);
+
+                if (lowByte == 0) break;
+                sb.Append((char)lowByte);
+
+                if (highByte == 0) break;
+                sb.Append((char)highByte);
             }
-            catch (Exception ex)
-            {
-                if (ex.Message.Contains("Busy")) return StatusCode(503, new { error = "Server Busy" });
-                return StatusCode(500, new { error = ex.Message });
-            }
+            return sb.ToString().Trim();
         }
     }
 
