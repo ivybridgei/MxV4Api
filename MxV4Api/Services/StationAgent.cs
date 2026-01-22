@@ -5,6 +5,11 @@ namespace MxV4Api.Services
 {
     public class StationAgent : IDisposable
     {
+        // 【关键修改 1】全局静态锁
+        // 所有的 StationAgent 实例共享这把锁
+        // 作用：确保同一时刻全系统只有一个线程在进行 COM 的创建或连接操作
+        private static readonly SemaphoreSlim _globalSetupLock = new SemaphoreSlim(1, 1);
+
         private readonly int _stationId;
         private readonly string _heartbeatDevice;
         private readonly int _heartbeatInterval;
@@ -99,14 +104,28 @@ namespace MxV4Api.Services
             ActUtlType plc = null;
             try
             {
-                _logger.LogInformation("初始化 COM 组件...");
-                plc = new ActUtlType();
-                plc.ActLogicalStationNumber = _stationId;
+                // 【关键修改 2】初始化时申请全局锁
+                // 必须锁住 new 和 Open，因为 MX v4 驱动在这两步不是线程安全的
+                _logger.LogInformation("等待驱动资源锁...");
+                _globalSetupLock.Wait();
+                
+                try
+                {
+                    _logger.LogInformation("获取锁成功，开始初始化 COM...");
+                    plc = new ActUtlType();
+                    plc.ActLogicalStationNumber = _stationId;
 
-                // 首次连接
-                int ret = plc.Open();
-                if (ret != 0) _logger.LogError($"连接失败: 0x{ret:X}");
-                else _logger.LogInformation("连接成功");
+                    int ret = plc.Open();
+                    if (ret != 0) _logger.LogError($"连接失败: 0x{ret:X}");
+                    else _logger.LogInformation("连接成功");
+                }
+                finally
+                {
+                    // 【关键修改 3】初始化完成后立即释放锁
+                    // 让其他站点可以开始初始化。此时本站点已经拿到句柄，后续读写不需要锁。
+                    _globalSetupLock.Release();
+                    _logger.LogInformation("初始化完成，释放锁。");
+                }
 
                 // 使用 While 循环配合 TryTake 实现空闲检测
                 while (!_cts.IsCancellationRequested)
@@ -140,22 +159,11 @@ namespace MxV4Api.Services
                     catch (Exception ex)
                     {
                         // === 遇错即重连策略 ===
-                        _logger.LogWarning($"检测到异常 ({ex.Message})，正在执行重连...");
-
-                        try
-                        {
-                            plc.Close();
-                            // 稍微冷却一下，防止死循环刷屏
-                            Thread.Sleep(500);
-
-                            int reRet = plc.Open();
-                            if (reRet == 0) _logger.LogInformation("重连成功");
-                            else _logger.LogError($"重连失败: 0x{reRet:X}");
-                        }
-                        catch (Exception fatal)
-                        {
-                            _logger.LogError($"重连过程发生致命错误: {fatal.Message}");
-                        }
+                        _logger.LogWarning($"检测到异常 ({ex.Message})，准备重连...");
+                        
+                        // 【关键修改 4】重连逻辑也需要加锁
+                        // 因为重连涉及到 Close 和 Open，这也属于驱动敏感操作
+                        PerformSafeReconnect(ref plc);
                     }
                 }
             }
@@ -166,6 +174,41 @@ namespace MxV4Api.Services
                     try { plc.Close(); } catch { }
                     System.Runtime.InteropServices.Marshal.ReleaseComObject(plc);
                 }
+            }
+        }
+
+        // 安全重连方法
+        private void PerformSafeReconnect(ref ActUtlType plc)
+        {
+            try
+            {
+                // 关闭不需要锁，先关了再说
+                try { plc.Close(); } catch { }
+                
+                // 冷却时间，避免在驱动崩溃时疯狂抢锁
+                Thread.Sleep(2000);
+
+                _logger.LogInformation("重连: 等待全局锁...");
+                _globalSetupLock.Wait(); // 申请锁
+                try
+                {
+                    _logger.LogInformation("重连: 获取锁成功，执行 Open...");
+                    
+                    // 甚至可以考虑在这里重新 new 一个对象，防止旧对象内部状态损坏
+                    // 但通常 Close/Open 就够了。如果这里还是不行，可以尝试释放 COM 再 new。
+                    
+                    int ret = plc.Open();
+                    if (ret == 0) _logger.LogInformation("重连成功");
+                    else _logger.LogError($"重连失败: 0x{ret:X}");
+                }
+                finally
+                {
+                    _globalSetupLock.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError($"重连过程发生错误: {ex.Message}");
             }
         }
 
