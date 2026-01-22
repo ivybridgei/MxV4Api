@@ -28,7 +28,7 @@ try
         string command = args[0].ToLower();
         if (command == "--install")
         {
-            InstallTask();
+            InstallTask(args);
             return;
         }
         if (command == "--uninstall")
@@ -102,7 +102,7 @@ finally
 // ========================================================================
 // 3. 任务计划程序安装逻辑 (交互模式 - Session 1)
 // ========================================================================
-static void InstallTask()
+static void InstallTask(string[] args)
 {
     const string TaskName = "MxV4Api_AutoRun";
     string exePath = Process.GetCurrentProcess().MainModule?.FileName;
@@ -116,18 +116,37 @@ static void InstallTask()
 
     Console.WriteLine("==================================================");
     Console.WriteLine("正在安装 PLC 接口服务 (交互模式 - Session 1)");
-    Console.WriteLine("此模式将配置为：[用户登录时自动运行]");
-    Console.WriteLine("这能完美解决 MX Component 在后台服务中连接失败的问题。");
-    Console.WriteLine("请确保您已配置了 Windows 自动登录 (AutoLogon)。");
     Console.WriteLine("==================================================");
+    
+    // 1. 尝试获取用户名 (优先从命令行参数获取，例如: --install MyUser)
+    string user = "Administrator";
+    if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+    {
+        user = args[1];
+        Console.WriteLine($"使用命令行指定的账户: {user}");
+    }
+    else
+    {
+        // 尝试从控制台读取，如果在 Win7 下崩溃则捕获并使用默认值
+        try
+        {
+            string currentUser = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
+            Console.Write($"请输入运行账户 (默认 {currentUser}): ");
+            
+            // 【修复点】：增加 try-catch 包裹 ReadLine，防止 Win7 崩溃
+            string input = Console.ReadLine();
+            
+            if (!string.IsNullOrWhiteSpace(input)) user = input.Trim();
+            else user = currentUser;
+        }
+        catch (IOException)
+        {
+            Console.WriteLine("\n[警告] 无法读取控制台输入 (Win7 兼容性问题)。");
+            Console.WriteLine("[提示] 将自动使用默认管理员账户: Administrator");
+            user = "Administrator";
+        }
+    }
 
-    // 获取当前用户，或者让用户输入
-    string currentUser = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
-    Console.Write($"请输入运行账户 (默认 {currentUser}): ");
-    string user = Console.ReadLine()?.Trim();
-    if (string.IsNullOrEmpty(user)) user = currentUser;
-
-    // 【修改点1】：不需要输入密码了，因为是“仅当用户登录时运行”
     Console.WriteLine($"\n将在用户 [{user}] 登录时自动启动...");
 
     try
@@ -142,58 +161,55 @@ static void InstallTask()
             td.RegistrationInfo.Description = "基于 .NET 8 和 MX Component v4 的 PLC 读写接口服务 (Session 1 桌面模式)";
             td.RegistrationInfo.Author = user;
 
-            // --- 【修改点2】触发器：登录时启动 (LogonTrigger) ---
+            // 触发器：登录时启动
             var logonTrigger = new LogonTrigger();
-            logonTrigger.UserId = user; // 指定监听哪个用户的登录
-            logonTrigger.Delay = TimeSpan.FromSeconds(10); // 登录后延迟10秒，等待桌面加载完毕
+            logonTrigger.UserId = user; 
+            logonTrigger.Delay = TimeSpan.FromSeconds(10);
             logonTrigger.Enabled = true;
             td.Triggers.Add(logonTrigger);
 
-            // --- 操作：启动程序 ---
+            // 操作：启动程序
             td.Actions.Add(new ExecAction(exePath, null, workDir));
 
-            // --- 核心设置：失败重启 ---
-            td.Settings.RestartCount = 999;
-            td.Settings.RestartInterval = TimeSpan.FromMinutes(1);
-            td.Settings.ExecutionTimeLimit = TimeSpan.Zero;
-            td.Settings.Priority = ProcessPriorityClass.High;
+            // 核心设置
+            td.Settings.RestartCount = 999; 
+            td.Settings.RestartInterval = TimeSpan.FromMinutes(1); 
+            td.Settings.ExecutionTimeLimit = TimeSpan.Zero; 
+            td.Settings.Priority = ProcessPriorityClass.High; 
             td.Settings.DisallowStartIfOnBatteries = false;
             td.Settings.StopIfGoingOnBatteries = false;
-            // 允许多实例运行设为 False (IgnoreNew)，防止重复启动
             td.Settings.MultipleInstances = TaskInstancesPolicy.IgnoreNew;
 
-            // --- 【修改点3】权限设置：交互式令牌 ---
-            // RunLevel.Highest: 以管理员权限运行
-            // LogonType.InteractiveToken: 仅当用户登录时运行 (核心关键！)
+            // 权限设置 (Win7 兼容性重点：LogonType)
             td.Principal.RunLevel = TaskRunLevel.Highest;
+            
+            // 【Win7 兼容性调整】
+            // Win7 有时对 InteractiveToken 支持不好，如果是 Win7，尝试 S4U 或者 InteractiveToken
+            // 但通常 InteractiveToken 是通用的。如果这里还报错，可以去掉 TaskLogonType 参数试试。
             td.Principal.LogonType = TaskLogonType.InteractiveToken;
 
-            // --- 注册任务 (不需要密码) ---
+            // 注册任务
             ts.RootFolder.RegisterTaskDefinition(
-                TaskName,
-                td,
-                TaskCreation.CreateOrUpdate,
-                user,
-                null, // 密码为 null
+                TaskName, 
+                td, 
+                TaskCreation.CreateOrUpdate, 
+                user, 
+                null, 
                 TaskLogonType.InteractiveToken);
 
             Console.WriteLine("\n[成功] 服务已安装！");
-            Console.WriteLine("[重要] 请配合 Sysinternals Autologon 工具实现服务器开机自动登录。");
-
-            try
+            Console.WriteLine("[重要] 请确保已配置 Windows 自动登录 (AutoLogon)。");
+            
+            try 
             {
                 Console.WriteLine("[提示] 正在尝试立即启动任务...");
                 var task = ts.GetTask(TaskName);
-                if (task != null)
-                {
-                    task.Run();
-                    Console.WriteLine("[成功] 任务已启动。请通过 http://IP:5000 验证。");
-                }
+                if (task != null) task.Run();
+                Console.WriteLine("[成功] 任务已启动。");
             }
-            catch (Exception runEx)
+            catch(Exception runEx)
             {
-                Console.WriteLine($"[注意] 立即启动受限 ({runEx.Message})，但这通常没问题。");
-                Console.WriteLine("请注销并重新登录，或重启电脑以测试自动启动。");
+                Console.WriteLine($"[注意] 立即启动受限 ({runEx.Message})，请注销重新登录测试。");
             }
         }
     }
