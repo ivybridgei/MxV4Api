@@ -27,8 +27,8 @@ namespace MxV4Api.Services
                 string hbDevice = _config.GetValue<string>("PlcSettings:HeartbeatDevice") ?? "D0";
                 int hbInterval = _config.GetValue<int>("PlcSettings:HeartbeatIntervalMs", 30000);
 
-                _logger.LogInformation($"创建站点 {id} 代理 (心跳: {hbDevice}, {hbInterval}ms)");
-                return new StationAgent(id, hbDevice, hbInterval, _loggerFactory);
+				_logger.LogDebug($"创建站点 {id} 代理");
+				return new StationAgent(id, hbDevice, hbInterval, _loggerFactory);
             });
         }
 

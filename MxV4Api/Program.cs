@@ -5,17 +5,28 @@ using MxV4Api.Services;
 using Serilog; // 【新增】引用 Serilog
 
 // ========================================================================
-// 0. 初始化 Serilog 日志配置
+// 0. 初始化 Serilog 日志配置 (精简版)
 // ========================================================================
-// 设置日志路径为当前 EXE 目录下的 logs 文件夹
 string logPath = Path.Combine(AppContext.BaseDirectory, "logs", "log-.txt");
 
 Log.Logger = new LoggerConfiguration()
-    .MinimumLevel.Information() // 最小日志级别
-                                // 写入控制台 (方便调试时看)
+    // 1. 全局最低级别：Information (为了保留我们的业务日志)
+    .MinimumLevel.Information()
+    
+    // 2. 【关键】强制屏蔽 Microsoft 和 System 的 Info 日志
+    //    这能减少 90% 的 HTTP 请求日志
+    .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("System", Serilog.Events.LogEventLevel.Warning)
+    .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
+
+    // 3. 写入文件配置
     .WriteTo.Console()
-    // 【关键】写入文件，按天滚动，保留 30 天
-    .WriteTo.File(logPath, rollingInterval: RollingInterval.Day, retainedFileCountLimit: 30)
+    .WriteTo.File(logPath, 
+        rollingInterval: RollingInterval.Day, 
+        retainedFileCountLimit: 15, // 缩减保留天数到15天 (既然日志量大，存太久也没用)
+        fileSizeLimitBytes: 50 * 1024 * 1024, // 单个文件限制 50MB
+        rollOnFileSizeLimit: true, // 超过 50MB 就切新文件，防止单个文件过大打不开
+        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}") // 简化格式，去掉 SourceContext
     .CreateLogger();
 
 try

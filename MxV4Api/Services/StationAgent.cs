@@ -190,9 +190,11 @@ namespace MxV4Api.Services
                         }
                         else
                         {
-                            int hbVal;
-                            int hbRet = plc.GetDevice(_heartbeatDevice, out hbVal);
-                            if (hbRet != 0) throw new Exception($"心跳失败 0x{hbRet:X}");
+						// === 空闲心跳逻辑 ===
+						// 【优化】心跳成功不记录日志，避免刷屏
+						int hbVal;
+						int hbRet = plc.GetDevice(_heartbeatDevice, out hbVal);
+						if (hbRet != 0) throw new Exception($"心跳失败 0x{hbRet:X}");
                         }
                     }
                     catch (OperationCanceledException) { break; }
