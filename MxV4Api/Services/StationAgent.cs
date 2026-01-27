@@ -25,7 +25,7 @@ namespace MxV4Api.Services
             _heartbeatInterval = heartbeatInterval;
             _logger = loggerFactory.CreateLogger($"Station_{stationId}");
 
-            _taskQueue = new BlockingCollection<Action<ActUtlType>>(boundedCapacity: 10);
+            _taskQueue = new BlockingCollection<Action<ActUtlType>>(boundedCapacity: 100);
             _cts = new CancellationTokenSource();
 
             _workerThread = new Thread(WorkerLoop)
@@ -148,9 +148,9 @@ namespace MxV4Api.Services
             if (!_taskQueue.TryAdd(plc =>
             {
                 try { action(plc); } catch (Exception ex) { tcs.SetException(new Exception($"Station {_stationId}: {ex.Message}")); throw; }
-            }, 500))
+            }, 3000))
             {
-                tcs.SetException(new Exception($"Station {_stationId} Busy (Queue Full)"));
+                tcs.SetException(new Exception($"Station {_stationId} Busy (Queue Full > 100)"));
             }
         }
 

@@ -16,9 +16,6 @@ namespace MxV4Api.Controllers
             _mxManager = mxManager;
         }
 
-        // 辅助：强制短连接
-        private void ForceShortConnection() => Response.Headers.Append("Connection", "close");
-
         // 辅助：获取代理
         private StationAgent GetAgent(int stationId) => _mxManager.GetAgent(stationId);
 
@@ -30,7 +27,6 @@ namespace MxV4Api.Controllers
         [HttpGet("{stationId}/read/{device}/{length?}")]
         public async Task<IActionResult> Read(int stationId, string device, int length = 1)
         {
-            ForceShortConnection();
             if (length < 1) length = 1;
 
             try
@@ -63,7 +59,6 @@ namespace MxV4Api.Controllers
         [HttpGet("{stationId}/read-string/{device}/{length}")]
         public async Task<IActionResult> ReadString(int stationId, string device, int length)
         {
-            ForceShortConnection();
             if (length < 1) length = 1;
 
             try
@@ -97,7 +92,6 @@ namespace MxV4Api.Controllers
         [HttpPost("{stationId}/write")]
         public async Task<IActionResult> Write(int stationId, [FromBody] WriteRequest req)
         {
-            ForceShortConnection();
             try
             {
                 var agent = GetAgent(stationId);
