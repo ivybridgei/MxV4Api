@@ -184,6 +184,18 @@ namespace MxV4Api.Services
                 {
                     try
                     {
+                        if (plc == null)
+                        {
+                            _logger.LogWarning("检测到 PLC 实例丢失，尝试重建...");
+                            PerformSafeReconnect(ref plc);
+
+                            if (plc == null)
+                            {
+                                Thread.Sleep(5000);
+                                continue;
+                            }
+                        }
+
                         if (_taskQueue.TryTake(out var action, _heartbeatInterval, _cts.Token))
                         {
                             action(plc);
@@ -222,17 +234,51 @@ namespace MxV4Api.Services
         {
             try
             {
-                try { plc.Close(); } catch { }
-                Thread.Sleep(2000);
+                _logger.LogWarning("开始执行深度重连流程...");
+
+                if (plc != null)
+                {
+                    try
+                    {
+                        plc.Close();
+                    }
+                    catch { }
+
+                    try
+                    {
+                        Marshal.FinalReleaseComObject(plc);
+                    }
+                    catch { }
+
+                    plc = null;
+                }
+
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+
+                Thread.Sleep(3000);
 
                 _logger.LogInformation("重连: 等待全局锁...");
                 _globalSetupLock.Wait();
                 try
                 {
-                    _logger.LogInformation("重连: 获取锁成功，执行 Open...");
+                    _logger.LogInformation("重连: 获取锁成功，正在创建全新 COM 实例...");
+
+                    plc = new ActUtlType();
+                    plc.ActLogicalStationNumber = _stationId;
+
                     int ret = plc.Open();
-                    if (ret == 0) _logger.LogInformation("重连成功");
-                    else _logger.LogError($"重连失败: 0x{ret:X}");
+                    if (ret == 0)
+                    {
+                        _logger.LogInformation("✅ 重连成功 (新实例)");
+                    }
+                    else
+                    {
+                        _logger.LogError($"❌ 重连失败: 0x{ret:X}");
+
+                        try { Marshal.FinalReleaseComObject(plc); } catch { }
+                        plc = null;
+                    }
                 }
                 finally
                 {
@@ -241,7 +287,7 @@ namespace MxV4Api.Services
             }
             catch (Exception ex)
             {
-                _logger.LogError($"重连过程发生错误: {ex.Message}");
+                _logger.LogError($"重连过程发生致命错误: {ex.Message}");
             }
         }
 
