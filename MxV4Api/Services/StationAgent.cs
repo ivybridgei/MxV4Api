@@ -2,6 +2,8 @@ using System.Collections; // 用于 BitArray
 using System.Collections.Concurrent;
 using ActUtlTypeLib;
 using System.Runtime.InteropServices;
+using Serilog;
+using ILogger = Microsoft.Extensions.Logging.ILogger;
 
 namespace MxV4Api.Services
 {
@@ -17,6 +19,9 @@ namespace MxV4Api.Services
         private readonly BlockingCollection<Action<ActUtlType>> _taskQueue;
         private readonly Thread _workerThread;
         private readonly CancellationTokenSource _cts;
+
+        // 【新增】连续失败计数器
+        private int _continuousFailures = 0;
 
         public StationAgent(int stationId, string heartbeatDevice, int heartbeatInterval, ILoggerFactory loggerFactory)
         {
@@ -202,11 +207,15 @@ namespace MxV4Api.Services
                         }
                         else
                         {
-						// === 空闲心跳逻辑 ===
-						// 【优化】心跳成功不记录日志，避免刷屏
-						int hbVal;
-						int hbRet = plc.GetDevice(_heartbeatDevice, out hbVal);
-						if (hbRet != 0) throw new Exception($"心跳失败 0x{hbRet:X}");
+                        // === 空闲心跳逻辑 ===
+                        // 【优化】心跳成功不记录日志，避免刷屏
+                        int hbVal;
+                        int hbRet = plc.GetDevice(_heartbeatDevice, out hbVal);
+                        if (hbRet != 0) throw new Exception($"心跳失败 0x{hbRet:X}");
+
+                        // 心跳成功，重置失败计数
+                        _continuousFailures = 0;
+
                         }
                     }
                     catch (OperationCanceledException) { break; }
@@ -235,6 +244,27 @@ namespace MxV4Api.Services
             try
             {
                 _logger.LogWarning("开始执行深度重连流程...");
+
+                // 【新增】每进入一次重连流程，计数器+1
+                // 只有在心跳成功或 Open 成功 (视策略而定) 时才清零
+                // 这里我们选择在 Open 成功时清零，或者在 WorkerLoop 心跳成功时清零
+                // 考虑到 0xF0000003 往往连 Open 都过不去，我们在这里累加
+                _continuousFailures++;
+
+                // 如果连续失败次数过多，说明当前进程的 COM 环境已彻底损坏 (僵尸进程)
+                // 必须自杀，让守护进程 (Guardian) 重启我们
+                if (_continuousFailures >= 5)
+                {
+                    _logger.LogCritical($"连续失败次数 ({_continuousFailures}) 达到阈值。判定 COM 组件处于不可恢复的死锁状态。");
+                    _logger.LogCritical(">>> 正在执行进程自杀 (Suicide)，等待守护进程重启...");
+                    
+                    // 确保日志落盘
+                    Serilog.Log.CloseAndFlush();
+
+                    
+                    // 强制退出码 1，告知 Guardian 发生了错误
+                    Environment.Exit(1);
+                }
 
                 if (plc != null)
                 {
@@ -271,6 +301,8 @@ namespace MxV4Api.Services
                     if (ret == 0)
                     {
                         _logger.LogInformation("✅ 重连成功 (新实例)");
+                        // 重连成功，重置计数器
+                        _continuousFailures = 0;
                     }
                     else
                     {
@@ -278,6 +310,8 @@ namespace MxV4Api.Services
 
                         try { Marshal.FinalReleaseComObject(plc); } catch { }
                         plc = null;
+                        
+                        // 注意：这里 Open 失败也会导致下一次循环再次调用 PerformSafeReconnect，从而增加计数
                     }
                 }
                 finally

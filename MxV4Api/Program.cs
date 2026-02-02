@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Win32;
 using Microsoft.Win32.TaskScheduler;
 using MxV4Api.Services;
 using Serilog; // 【新增】引用 Serilog
@@ -14,7 +15,6 @@ Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
     
     // 2. 【关键】强制屏蔽 Microsoft 和 System 的 Info 日志
-    //    这能减少 90% 的 HTTP 请求日志
     .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
     .MinimumLevel.Override("System", Serilog.Events.LogEventLevel.Warning)
     .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
@@ -23,40 +23,78 @@ Log.Logger = new LoggerConfiguration()
     .WriteTo.Console()
     .WriteTo.File(logPath, 
         rollingInterval: RollingInterval.Day, 
-        retainedFileCountLimit: 15, // 缩减保留天数到15天 (既然日志量大，存太久也没用)
-        fileSizeLimitBytes: 50 * 1024 * 1024, // 单个文件限制 50MB
-        rollOnFileSizeLimit: true, // 超过 50MB 就切新文件，防止单个文件过大打不开
-        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}") // 简化格式，去掉 SourceContext
+        retainedFileCountLimit: 15,
+        fileSizeLimitBytes: 50 * 1024 * 1024,
+        rollOnFileSizeLimit: true,
+        shared: true, // 【关键】开启共享写入，支持多进程 (Guardian + Worker)
+        outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
     .CreateLogger();
 
 try
 {
     // ========================================================================
-    // 1. 命令行参数拦截 (安装/卸载逻辑)
+    // 1. 启动模式分流 (Guardian / Worker / Install)
     // ========================================================================
+    string exePath = Process.GetCurrentProcess().MainModule?.FileName ?? string.Empty;
+    string workDir = AppContext.BaseDirectory;
+
+    string mode = "guardian"; // 默认模式
+
     if (args.Length > 0)
     {
-        string command = args[0].ToLower();
-        if (command == "--install")
-        {
-            InstallTask(args);
-            return;
-        }
-        if (command == "--uninstall")
-        {
-            UninstallTask();
-            return;
-        }
+        string arg0 = args[0].ToLower();
+        if (arg0 == "--worker") mode = "worker";
+        else if (arg0 == "--install") mode = "install";
+        else if (arg0 == "--uninstall") mode = "uninstall";
     }
 
-    Log.Information(">>> 程序正在启动...");
+    if (mode == "install")
+    {
+        InstallAutoStart(exePath, workDir);
+        return;
+    }
+    if (mode == "uninstall")
+    {
+        UninstallAutoStart();
+        return;
+    }
 
-    // ========================================================================
-    // 2. WebAPI 主程序逻辑
-    // ========================================================================
+    if (mode == "worker")
+    {
+        RunWorker(args);
+    }
+    else
+    {
+        RunGuardian(exePath);
+    }
+}
+catch (Exception ex)
+{
+    // 捕获启动过程中的致命错误
+    Log.Fatal(ex, ">>> [Main] 程序意外终止");
+}
+finally
+{
+    Log.CloseAndFlush();
+}
+
+// ========================================================================
+// 业务逻辑方法
+// ========================================================================
+
+static void RunWorker(string[] args)
+{
+    // 防止 Worker 多开互斥锁
+    using var mutex = new Mutex(false, "Global\\MxV4Api_Worker_Lock", out bool createdNew);
+    if (!createdNew)
+    {
+        Log.Warning("Worker 实例已存在，当前进程退出。");
+        return;
+    }
+
+    Log.Information(">>> [Worker] API 服务正在启动...");
+
     var builder = WebApplication.CreateBuilder(args);
-
-    // 【新增】将 Serilog 替换为系统的默认日志提供程序
     builder.Host.UseSerilog();
 
     builder.Services.AddSingleton<MxService>();
@@ -72,7 +110,6 @@ try
 
     var app = builder.Build();
 
-    // 即使在生产环境也开启 Swagger，方便您查看
     app.UseSwagger();
     app.UseSwaggerUI();
 
@@ -80,171 +117,151 @@ try
     app.UseAuthorization();
     app.MapControllers();
 
-    // ============================================================
-    // 执行异步预热
-    // ============================================================
+    // 预热任务
     _ = System.Threading.Tasks.Task.Run(async () =>
     {
         try
         {
-            Log.Information(">>> 触发后台预热任务...");
+            // 稍作延迟，等待 Server Ready
+            await System.Threading.Tasks.Task.Delay(2000);
+            Log.Information(">>> [Worker] 触发后台预热任务...");
             var mxManager = app.Services.GetRequiredService<MxService>();
             await mxManager.PreWarmAsync();
         }
         catch (Exception ex)
         {
-            Log.Error(ex, ">>> 预热异常");
+            Log.Error(ex, ">>> [Worker] 预热异常");
         }
     });
 
     app.Run();
 }
-catch (Exception ex)
+
+static void RunGuardian(string exePath)
 {
-    // 捕获启动过程中的致命错误
-    Log.Fatal(ex, ">>> 程序意外终止");
-}
-finally
-{
-    Log.CloseAndFlush();
-}
-
-
-// ========================================================================
-// 3. 任务计划程序安装逻辑 (标准开机自启版 - Session 1)
-// ========================================================================
-static void InstallTask(string[] args)
-{
-    const string TaskName = "MxV4Api_AutoRun";
-    string exePath = Process.GetCurrentProcess().MainModule?.FileName;
-    string workDir = AppContext.BaseDirectory;
-
-    if (string.IsNullOrEmpty(exePath)) return;
-
-    // 1. 获取用户名逻辑 (保持不变)
-    string user = "Administrator";
-    if (args.Length > 1 && !string.IsNullOrWhiteSpace(args[1]))
+    // 防止 Guardian 多开
+    using var mutex = new Mutex(false, "Global\\MxV4Api_Guardian_Lock", out bool createdNew);
+    if (!createdNew)
     {
-        user = args[1];
-        Console.WriteLine($"使用命令行指定的账户: {user}");
+        return; // 静默退出
     }
-    else
+
+    Log.Information(">>> [Guardian] 守护进程已启动 (可双击托盘图标或查看日志)");
+
+    while (true)
     {
         try
         {
-            string currentUser = System.Security.Principal.WindowsIdentity.GetCurrent().Name;
-            Console.Write($"请输入运行账户 (默认 {currentUser}): ");
-            string input = Console.ReadLine();
-            if (!string.IsNullOrWhiteSpace(input)) user = input.Trim();
-            else user = currentUser;
-        }
-        catch (IOException)
-        {
-            Console.WriteLine("\n[Win7兼容模式] 使用默认账户: Administrator");
-            user = "Administrator";
-        }
-    }
+            Log.Information(">>> [Guardian] 正在拉起 Worker 子进程...");
 
-    Console.WriteLine($"\n配置目标：用户 [{user}] 登录时自动启动...");
-
-    try
-    {
-        using (TaskService ts = new TaskService())
-        {
-            // 清理旧任务
-            var existingTask = ts.GetTask(TaskName);
-            if (existingTask != null) ts.RootFolder.DeleteTask(TaskName);
-
-            TaskDefinition td = ts.NewTask();
-            td.RegistrationInfo.Description = "PLC 接口服务 (登录自启)";
-            td.RegistrationInfo.Author = user;
-
-            // =========================================================
-            // 触发器：仅在登录时触发一次
-            // =========================================================
-            var logonTrigger = new LogonTrigger();
-            logonTrigger.UserId = user;
-            logonTrigger.Delay = TimeSpan.FromSeconds(10); // 登录后延迟10秒，等待桌面加载
-            logonTrigger.Enabled = true;
-            td.Triggers.Add(logonTrigger);
-
-            // =========================================================
-            // 设置：标准后台运行配置
-            // =========================================================
-            // 如果程序已在运行，忽略新的启动请求（防止重复）
-            td.Settings.MultipleInstances = TaskInstancesPolicy.IgnoreNew;
-
-            // 允许无限制运行
-            td.Settings.ExecutionTimeLimit = TimeSpan.Zero;
-            td.Settings.Priority = ProcessPriorityClass.High;
-            td.Settings.DisallowStartIfOnBatteries = false;
-            td.Settings.StopIfGoingOnBatteries = false;
-
-            // 【可选】崩溃自动重启 (仅针对程序崩溃，不针对手动Kill)
-            // 如果不需要可以注释掉下面两行
-            td.Settings.RestartCount = 3;
-            td.Settings.RestartInterval = TimeSpan.FromMinutes(1);
-
-            // =========================================================
-            // 操作与权限
-            // =========================================================
-            td.Actions.Add(new ExecAction(exePath, null, workDir));
-
-            // 关键：交互式令牌 (Session 1)
-            td.Principal.RunLevel = TaskRunLevel.Highest;
-            td.Principal.LogonType = TaskLogonType.InteractiveToken;
-
-            // 注册任务
-            ts.RootFolder.RegisterTaskDefinition(
-                TaskName,
-                td,
-                TaskCreation.CreateOrUpdate,
-                user,
-                null,
-                TaskLogonType.InteractiveToken);
-
-            Console.WriteLine("\n[成功] 服务已安装！");
-            Console.WriteLine("机制：配置了 Windows 自动登录后，开机即启动。");
-
-            try
+            var psi = new ProcessStartInfo(exePath, "--worker")
             {
-                var task = ts.GetTask(TaskName);
-                if (task != null)
-                {
-                    task.Run();
-                    Console.WriteLine("[成功] 任务已立即启动。");
-                }
-            }
-            catch (Exception runEx)
+                WorkingDirectory = AppContext.BaseDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = false
+            };
+
+            var p = Process.Start(psi);
+            if (p != null)
             {
-                Console.WriteLine($"[注意] 立即启动受限 ({runEx.Message})，请重启电脑测试。");
+                Log.Information($">>> [Guardian] Worker PID: {p.Id}");
+                p.WaitForExit();
+                Log.Warning($">>> [Guardian] Worker 停止 (ExitCode: {p.ExitCode})，准备重启...");
             }
         }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"\n[失败] {ex.Message}");
+        catch (Exception ex)
+        {
+            Log.Error(ex, ">>> [Guardian] 启动 Worker 异常");
+        }
+
+        // 避免 CPU 此时狂转
+        Thread.Sleep(2000);
     }
 }
 
-
-static void UninstallTask()
+static void InstallAutoStart(string exePath, string workDir)
 {
-    const string TaskName = "MxV4Api_AutoRun";
+    Console.WriteLine("=== 安装开机自启 (Registry + Startup) ===");
+    
+    // 1. 清理旧版
+    UninstallAutoStart(cleanOnly: true);
+
     try
     {
-        using (TaskService ts = new TaskService())
+        // 2. 注册表启动
+        using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
         {
-            var task = ts.GetTask(TaskName);
-            if (task != null)
+            if (key != null)
             {
-                ts.RootFolder.DeleteTask(TaskName);
-                Console.WriteLine($"[成功] 服务 '{TaskName}' 已卸载。");
+                key.SetValue("MxV4Api", $"\"{exePath}\"");
+                Console.WriteLine("[成功] 注册表启动项已添加。");
             }
         }
+
+        // 3. 启动文件夹快捷方式 (PowerShell)
+        string linkPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "MxV4Api.lnk");
+        string pScript = $@"
+$w=New-Object -com WScript.Shell;
+$s=$w.CreateShortcut('{linkPath}');
+$s.TargetPath='{exePath}';
+$s.WorkingDirectory='{workDir}';
+$s.Save()";
+        
+        var psi = new ProcessStartInfo("powershell", $"-Command \"{pScript}\"") { CreateNoWindow=true, UseShellExecute=false };
+        Process.Start(psi)?.WaitForExit();
+        Console.WriteLine("[成功] 启动文件夹快捷方式已创建。");
+        
+        // 4. 尝试立即启动
+        Console.WriteLine("正在启动守护进程...");
+        Process.Start(new ProcessStartInfo(exePath) { UseShellExecute = true });
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[失败] 卸载出错: {ex.Message}");
+        Console.WriteLine($"[Error] {ex.Message}");
     }
+}
+
+static void UninstallAutoStart(bool cleanOnly = false)
+{
+    if (!cleanOnly) Console.WriteLine("=== 卸载开机自启 ===");
+
+    // 1. 清理任务计划 (旧版)
+    try
+    {
+        using (var ts = new TaskService())
+        {
+            if (ts.GetTask("MxV4Api_AutoRun") != null)
+            {
+                ts.RootFolder.DeleteTask("MxV4Api_AutoRun");
+                if (!cleanOnly) Console.WriteLine("[成功] 旧版任务计划程序已清理。");
+            }
+        }
+    }
+    catch { /* 忽略 */ }
+
+    // 2. 清理注册表
+    try
+    {
+        using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+        {
+            if (key != null && key.GetValue("MxV4Api") != null)
+            {
+                key.DeleteValue("MxV4Api");
+                if (!cleanOnly) Console.WriteLine("[成功] 注册表启动项已移除。");
+            }
+        }
+    }
+    catch { }
+
+    // 3. 清理启动文件夹
+    try
+    {
+        string linkPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "MxV4Api.lnk");
+        if (File.Exists(linkPath))
+        {
+            File.Delete(linkPath);
+            if (!cleanOnly) Console.WriteLine("[成功] 启动便签已移除。");
+        }
+    }
+    catch { }
 }
