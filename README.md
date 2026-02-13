@@ -1,5 +1,7 @@
 # MxV4Api: Mitsubishi PLC Communication RESTful API Service
 
+[中文说明](README_zh.md)
+
 `MxV4Api` is a high-performance, high-reliability Mitsubishi PLC communication middleware designed for Industry 4.0 scenarios. Developed on **.NET 8**, it wraps the traditional **Mitsubishi MX Component (ActUtlType)** COM controls into a modern, easy-to-use **RESTful API**.
 
 ### 🌟 Core Pain Points Solved
