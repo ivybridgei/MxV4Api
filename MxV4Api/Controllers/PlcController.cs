@@ -5,36 +5,28 @@ using MxV4Api.Services;
 namespace MxV4Api.Controllers
 {
     [ApiController]
-    [Route("api/plc")] // 基础路由
+    [Route("api/plc")]
     [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
     public class PlcController : ControllerBase
     {
         private readonly MxService _mxManager;
+        private readonly ILogger<PlcController> _logger;
 
-        public PlcController(MxService mxManager)
+        public PlcController(MxService mxManager, ILogger<PlcController> logger)
         {
             _mxManager = mxManager;
+            _logger = logger;
         }
 
-        // 辅助：获取代理
         private StationAgent GetAgent(int stationId) => _mxManager.GetAgent(stationId);
 
-        // ============================================================
-        // 1. 读取数值 (支持单个或批量)
-        // URL: GET /api/plc/{stationId}/read/{device}/{length?}
-        // length 默认为 1
-        // ============================================================
         [HttpGet("{stationId}/read/{device}/{length?}")]
         public async Task<IActionResult> Read(int stationId, string device, int length = 1)
         {
             if (length < 1) length = 1;
-
             try
             {
-                // 获取对应站点的代理（如果没有会自动创建线程）
                 var agent = GetAgent(stationId);
-
-                // 统一返回数组，方便前端处理
                 int[] data = await agent.ReadBlockAsync(device, length);
 
                 return Ok(new
@@ -42,31 +34,24 @@ namespace MxV4Api.Controllers
                     station = stationId,
                     device,
                     length,
-                    data = data, // 数组格式 [123, 456, ...]
+                    data = data,
                     t = DateTime.Now.Ticks
                 });
             }
             catch (Exception ex)
             {
-                return HandleError(ex);
+                return HandleError(ex, stationId, "Read", $"{device} (Len: {length})");
             }
         }
 
-        // ============================================================
-        // 2. 读取字符串 (自动 ASCII 解码)
-        // URL: GET /api/plc/{stationId}/read-string/{device}/{length}
-        // ============================================================
         [HttpGet("{stationId}/read-string/{device}/{length}")]
         public async Task<IActionResult> ReadString(int stationId, string device, int length)
         {
             if (length < 1) length = 1;
-
             try
             {
                 var agent = GetAgent(stationId);
                 int[] rawData = await agent.ReadBlockAsync(device, length);
-
-                // 转换逻辑：int[] -> string
                 string result = IntsToAscii(rawData);
 
                 return Ok(new
@@ -80,15 +65,10 @@ namespace MxV4Api.Controllers
             }
             catch (Exception ex)
             {
-                return HandleError(ex);
+                return HandleError(ex, stationId, "ReadString", $"{device} (Len: {length})");
             }
         }
 
-        // ============================================================
-        // 3. 写入数值
-        // URL: POST /api/plc/{stationId}/write
-        // Body: { "device": "D100", "value": 123 }
-        // ============================================================
         [HttpPost("{stationId}/write")]
         public async Task<IActionResult> Write(int stationId, [FromBody] WriteRequest req)
         {
@@ -100,29 +80,28 @@ namespace MxV4Api.Controllers
             }
             catch (Exception ex)
             {
-                return HandleError(ex);
+                return HandleError(ex, stationId, "Write", $"{req.Device} = {req.Value}");
             }
         }
 
-        // 统一错误处理
-        private IActionResult HandleError(Exception ex)
+        private IActionResult HandleError(Exception ex, int stationId, string action, string detail)
         {
-            // 如果是队列满或超时
-            if (ex.Message.Contains("Busy") || ex.Message.Contains("Queue Full"))
-                return StatusCode(503, new { error = "Station Busy" });
+            _logger.LogError($"[API请求失败] 站点: {stationId} | 动作: {action} | 目标: {detail} | 原因: {ex.Message}");
+
+            if (ex.Message.Contains("Busy") || ex.Message.Contains("Queue Full") || ex.Message.Contains("处于断开状态"))
+            {
+                return StatusCode(503, new { error = "Station Offline or Busy", detail = ex.Message });
+            }
 
             return StatusCode(500, new { error = ex.Message });
         }
 
-        // 辅助：Int/Short 转 ASCII 字符串
         private string IntsToAscii(int[] data)
         {
             if (data == null || data.Length == 0) return string.Empty;
             StringBuilder sb = new StringBuilder(data.Length * 2);
             foreach (int val in data)
             {
-                // MX Component ReadDeviceBlock2 读出来的是 short 强转的 int
-                // 低位在前，高位在后
                 byte lowByte = (byte)(val & 0xFF);
                 byte highByte = (byte)((val >> 8) & 0xFF);
 
